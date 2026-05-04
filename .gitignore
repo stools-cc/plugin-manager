@@ -1,0 +1,14 @@
+build/
+deps/
+*.dll
+*.so
+*.dylib
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+.vs/
+.vscode/
+CMakeCache.txt
+CMakeFiles/
