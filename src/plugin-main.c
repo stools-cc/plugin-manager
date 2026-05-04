@@ -22,6 +22,15 @@ static const char *g_locale = NULL;
 static pthread_t g_init_thread;
 static volatile bool g_init_done = false;
 
+static char g_update_msg[1024] = "";
+
+static void show_update_alert(void *param)
+{
+	(void)param;
+	if (g_update_msg[0])
+		manager_dialog_show(g_locale);
+}
+
 static void *init_thread_func(void *arg)
 {
 	(void)arg;
@@ -38,40 +47,40 @@ static void *init_thread_func(void *arg)
 							  sizeof(obs_dir))) {
 				downloader_detect_installed(&plugins, obs_dir);
 
+				int updates = 0;
 				for (int i = 0; i < plugins.count; i++) {
 					struct plugin_info *pi =
 						&plugins.items[i];
-					if (!pi->installed ||
+					if (pi->installed &&
 					    pi->update_available) {
+						updates++;
 						dbg_log(LOG_INFO,
-							"[%s] Auto-installing %s v%s",
-							PLUGIN_NAME, pi->slug,
+							"[%s] Update available: %s %s -> %s",
+							PLUGIN_NAME, pi->name,
+							pi->installed_version,
 							pi->latest_version);
-						if (downloader_install_plugin(
-							    auth_get_token(),
-							    pi->slug,
-							    obs_dir)) {
-							char vp[512];
-							snprintf(vp,
-								 sizeof(vp),
-								 "%s"
-#ifdef _WIN32
-								 "\\"
-#else
-								 "/"
-#endif
-								 "%s.version",
-								 obs_dir,
-								 pi->slug);
-							FILE *f = fopen(vp,
-									"w");
-							if (f) {
-								fputs(pi->latest_version,
-								      f);
-								fclose(f);
-							}
-						}
 					}
+				}
+
+				if (updates > 0) {
+					bool de = g_locale &&
+						  g_locale[0] == 'd' &&
+						  g_locale[1] == 'e';
+					if (updates == 1)
+						snprintf(g_update_msg,
+							 sizeof(g_update_msg),
+							 de ? "1 Plugin-Update verfügbar."
+							    : "1 plugin update available.");
+					else
+						snprintf(g_update_msg,
+							 sizeof(g_update_msg),
+							 de ? "%d Plugin-Updates verfügbar."
+							    : "%d plugin updates available.",
+							 updates);
+
+					obs_queue_task(OBS_TASK_UI,
+						       show_update_alert,
+						       NULL, false);
 				}
 			}
 		}

@@ -1,0 +1,254 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 1.0.0)'
+        required: true
+
+env:
+  OBS_VERSION: '32.1.0'
+  OBS_DEPS_VERSION: '2025-08-23'
+  PLUGIN_NAME: 'st-pluginmanager'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Clone OBS headers
+        shell: bash
+        run: |
+          git clone --depth 1 --branch ${{ env.OBS_VERSION }} \
+            --filter=blob:none --sparse \
+            https://github.com/obsproject/obs-studio.git deps/obs-studio
+          cd deps/obs-studio
+          git sparse-checkout set libobs frontend/api deps/w32-pthreads
+
+      - name: Create obsconfig.h
+        shell: powershell
+        run: |
+          @"
+          #pragma once
+          #define OBS_DATA_PATH "data"
+          #define OBS_PLUGIN_PATH "obs-plugins/64bit"
+          #define OBS_PLUGIN_DESTINATION "obs-plugins/64bit"
+          #define OBS_INSTALL_PREFIX "C:/Program Files/obs-studio"
+          #define OBS_RELEASE_CANDIDATE 0
+          #define OBS_BETA 0
+          "@ | Out-File -Encoding ASCII "deps/obs-studio/libobs/obsconfig.h"
+
+      - name: Download OBS deps
+        shell: powershell
+        run: |
+          $url = "https://github.com/obsproject/obs-deps/releases/download/${{ env.OBS_DEPS_VERSION }}/windows-deps-${{ env.OBS_DEPS_VERSION }}-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile deps/obs-deps.zip -UseBasicParsing
+          Expand-Archive -Path deps/obs-deps.zip -DestinationPath deps/obs-deps -Force
+
+      - name: Download Qt6 deps
+        shell: powershell
+        run: |
+          $url = "https://github.com/obsproject/obs-deps/releases/download/${{ env.OBS_DEPS_VERSION }}/windows-deps-qt6-${{ env.OBS_DEPS_VERSION }}-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile deps/qt6.zip -UseBasicParsing
+          Expand-Archive -Path deps/qt6.zip -DestinationPath deps/qt6 -Force
+
+      - name: Download OBS binaries
+        shell: powershell
+        run: |
+          $url = "https://github.com/obsproject/obs-studio/releases/download/${{ env.OBS_VERSION }}/OBS-Studio-${{ env.OBS_VERSION }}-Windows-x64.zip"
+          Invoke-WebRequest -Uri $url -OutFile deps/obs-bin.zip -UseBasicParsing
+          Expand-Archive -Path deps/obs-bin.zip -DestinationPath deps/obs-bin -Force
+
+      - name: Generate import libraries
+        shell: powershell
+        run: |
+          $outDir = "deps/obs-libs"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          foreach ($dllName in @("obs", "obs-frontend-api", "w32-pthreads")) {
+              $dll = Get-ChildItem -Path "deps/obs-bin" -Filter "$dllName.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if (-not $dll) { throw "Could not find $dllName.dll in deps/obs-bin" }
+              Write-Host "Found: $($dll.FullName)"
+              $raw = (& dumpbin /exports $dll.FullName 2>&1) | Out-String
+              $lines = $raw -split "`r?`n"
+              $defLines = @("LIBRARY ""$dllName""", "EXPORTS")
+              $capture = $false
+              foreach ($line in $lines) {
+                  if ($line -match "ordinal\s+hint\s+RVA\s+name") { $capture = $true; continue }
+                  if ($capture -and $line -match "^\s*Summary") { break }
+                  if ($capture -and $line -match "^\s+(\d+)\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)") {
+                      $defLines += ("    " + $Matches[2])
+                  }
+              }
+              $exportCount = $defLines.Count - 2
+              Write-Host "  $dllName exports: $exportCount"
+              if ($exportCount -lt 1) { throw "No exports found in $dllName.dll" }
+              $defLines -join "`n" | Out-File -Encoding ASCII "$outDir/$dllName.def" -NoNewline
+              & lib /nologo /def:"$outDir/$dllName.def" /out:"$outDir/$dllName.lib" /machine:x64
+              if (-not (Test-Path "$outDir/$dllName.lib")) { throw "Failed to create $dllName.lib" }
+          }
+
+      - name: Build plugin
+        shell: powershell
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+            -DCMAKE_C_COMPILER=cl `
+            -DCMAKE_CXX_COMPILER=cl `
+            -DOBS_SOURCE_DIR="deps/obs-studio" `
+            -DOBS_LIB_DIR="deps/obs-libs" `
+            -DQT6_DIR="deps/qt6" `
+            -DCURL_DIR="deps/obs-deps" `
+            -DPLUGIN_VERSION_OVERRIDE="${{ steps.version.outputs.version }}"
+          cmake --build build --config RelWithDebInfo
+
+      - name: Package
+        shell: powershell
+        run: |
+          $ver = "${{ steps.version.outputs.version }}"
+          New-Item -ItemType Directory -Force "release" | Out-Null
+          $dir = "staging/st-pluginmanager"
+          New-Item -ItemType Directory -Force "$dir/obs-plugins/64bit" | Out-Null
+          Copy-Item "build/st-pluginmanager.dll" "$dir/obs-plugins/64bit/"
+          Compress-Archive -Path "$dir/*" -DestinationPath "release/st-pluginmanager-$ver-windows-x64.zip"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-release
+          path: release/*
+
+  build-linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install dependencies
+        run: |
+          sudo add-apt-repository ppa:obsproject/obs-studio -y
+          sudo apt-get update
+          sudo apt-get install -y \
+            libobs-dev \
+            qt6-base-dev \
+            libcurl4-openssl-dev libxkbcommon-dev \
+            cmake ninja-build pkg-config
+
+      - name: Setup OBS frontend headers
+        id: frontend
+        run: |
+          if pkg-config --cflags obs-frontend-api 2>/dev/null; then
+            echo "Found obs-frontend-api via pkg-config"
+            echo "cmake_arg=" >> $GITHUB_OUTPUT
+          elif [ -f /usr/include/obs/obs-frontend-api.h ]; then
+            echo "Found obs-frontend-api.h in system includes"
+            echo "cmake_arg=" >> $GITHUB_OUTPUT
+          else
+            SYS_VER=$(pkg-config --modversion libobs | cut -d. -f1-3)
+            echo "Cloning OBS $SYS_VER frontend headers..."
+            git clone --depth 1 --branch "$SYS_VER" \
+              --filter=blob:none --sparse \
+              https://github.com/obsproject/obs-studio.git deps/obs-studio
+            cd deps/obs-studio
+            git sparse-checkout set frontend/api
+            echo "cmake_arg=-DOBS_FRONTEND_INCLUDE_DIR=deps/obs-studio/frontend/api" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build plugin
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DPLUGIN_VERSION_OVERRIDE="${{ steps.version.outputs.version }}" \
+            ${{ steps.frontend.outputs.cmake_arg }}
+          cmake --build build
+
+      - name: Package
+        run: |
+          ver="${{ steps.version.outputs.version }}"
+          mkdir -p release
+          mkdir -p staging/obs-plugins
+          cp build/st-pluginmanager.so staging/obs-plugins/
+          cd staging
+          tar czf ../release/st-pluginmanager-$ver-linux-x86_64.tar.gz *
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: linux-release
+          path: release/*
+
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+            echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            echo "tag=v${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: stools Plugin Manager v${{ steps.version.outputs.version }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            ### Windows
+            1. Download **`st-pluginmanager-${{ steps.version.outputs.version }}-windows-x64.zip`**
+            2. Extract into your OBS Studio folder (e.g. `C:\Program Files\obs-studio\`)
+            3. Restart OBS
+
+            ### Linux
+            1. Download **`st-pluginmanager-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz`**
+            2. Extract to `/usr/lib/obs-plugins/`
+            3. Restart OBS
+          files: |
+            artifacts/windows-release/*
+            artifacts/linux-release/*

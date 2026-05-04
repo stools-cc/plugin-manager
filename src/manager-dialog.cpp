@@ -20,6 +20,7 @@
 extern "C" {
 #include "auth.h"
 #include "downloader.h"
+#include "oauth.h"
 }
 
 #include "manager-dialog.hpp"
@@ -36,7 +37,8 @@ public:
 	{
 		bool de = is_de(locale);
 		setWindowTitle("stools Plugin Manager");
-		setMinimumSize(600, 450);
+		setMinimumSize(680, 450);
+		resize(700, 480);
 
 		auto *mainLayout = new QVBoxLayout(this);
 		mainLayout->setContentsMargins(16, 16, 16, 16);
@@ -58,13 +60,8 @@ public:
 		m_statusLabel = new QLabel();
 		authLayout->addWidget(m_statusLabel, 1);
 
-		m_tokenInput = new QLineEdit();
-		m_tokenInput->setEchoMode(QLineEdit::Password);
-		m_tokenInput->setPlaceholderText("API Token");
-		m_tokenInput->setMinimumWidth(200);
-		authLayout->addWidget(m_tokenInput);
-
-		m_loginBtn = new QPushButton(de ? "Anmelden" : "Login");
+		m_loginBtn = new QPushButton(
+			de ? "Mit stools.cc anmelden" : "Login with stools.cc");
 		connect(m_loginBtn, &QPushButton::clicked, this,
 			&ManagerDialog::onLogin);
 		authLayout->addWidget(m_loginBtn);
@@ -91,14 +88,19 @@ public:
 		m_table->horizontalHeader()->setSectionResizeMode(
 			0, QHeaderView::Stretch);
 		m_table->horizontalHeader()->setSectionResizeMode(
-			1, QHeaderView::ResizeToContents);
+			1, QHeaderView::Fixed);
 		m_table->horizontalHeader()->setSectionResizeMode(
-			2, QHeaderView::ResizeToContents);
+			2, QHeaderView::Fixed);
 		m_table->horizontalHeader()->setSectionResizeMode(
-			3, QHeaderView::ResizeToContents);
+			3, QHeaderView::Fixed);
+		m_table->setColumnWidth(1, 120);
+		m_table->setColumnWidth(2, 90);
+		m_table->setColumnWidth(3, 110);
 		m_table->verticalHeader()->setVisible(false);
 		m_table->setSelectionMode(QAbstractItemView::NoSelection);
 		m_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+		m_table->setShowGrid(false);
+		m_table->setAlternatingRowColors(true);
 		mainLayout->addWidget(m_table, 1);
 
 		/* ---- Refresh button ---- */
@@ -131,7 +133,6 @@ private:
 	QString m_locale;
 	QFrame *m_authFrame;
 	QLabel *m_statusLabel;
-	QLineEdit *m_tokenInput;
 	QPushButton *m_loginBtn;
 	QPushButton *m_logoutBtn;
 	QTableWidget *m_table;
@@ -144,7 +145,6 @@ private:
 		bool de = is_de(m_locale.toUtf8().constData());
 		bool logged_in = auth_is_logged_in();
 
-		m_tokenInput->setVisible(!logged_in);
 		m_loginBtn->setVisible(!logged_in);
 		m_logoutBtn->setVisible(logged_in);
 		m_refreshBtn->setEnabled(logged_in);
@@ -166,28 +166,36 @@ private:
 
 	void onLogin()
 	{
-		QString token = m_tokenInput->text().trimmed();
-		if (token.isEmpty()) return;
-
-		m_loginBtn->setEnabled(false);
-		m_loginBtn->setText("...");
-		QApplication::processEvents();
-
-		bool ok = auth_login(token.toUtf8().constData());
 		bool de = is_de(m_locale.toUtf8().constData());
 
-		m_loginBtn->setEnabled(true);
-		m_loginBtn->setText(de ? "Anmelden" : "Login");
+		m_loginBtn->setEnabled(false);
+		m_loginBtn->setText(de ? "Browser öffnet..." : "Opening browser...");
+		QApplication::processEvents();
 
-		if (ok) {
-			m_tokenInput->clear();
-			updateAuthUI();
-			onRefresh();
+		char token[512] = "";
+		bool got_token = oauth_start_flow(token, sizeof(token));
+
+		if (got_token && token[0]) {
+			bool ok = auth_login(token);
+			if (ok) {
+				updateAuthUI();
+				onRefresh();
+			} else {
+				QMessageBox::warning(
+					this, "stools Plugin Manager",
+					de ? "Token-Validierung fehlgeschlagen."
+					   : "Token validation failed.");
+			}
 		} else {
-			QMessageBox::warning(this, "stools Plugin Manager",
-					     de ? "Ungültiger Token."
-						: "Invalid token.");
+			QMessageBox::warning(
+				this, "stools Plugin Manager",
+				de ? "Login abgebrochen oder fehlgeschlagen."
+				   : "Login cancelled or failed.");
 		}
+
+		m_loginBtn->setEnabled(true);
+		m_loginBtn->setText(
+			de ? "Mit Twitch anmelden" : "Login with Twitch");
 	}
 
 	void onLogout()
@@ -291,25 +299,22 @@ private:
 			return;
 		}
 
+		int asset_id = 0;
+		for (int i = 0; i < m_plugins.count; i++) {
+			if (slug == m_plugins.items[i].slug) {
+				asset_id = m_plugins.items[i].download_asset_id;
+				break;
+			}
+		}
+
 		bool ok = downloader_install_plugin(
-			auth_get_token(), slug.toUtf8().constData(), obs_dir);
+			auth_get_token(), slug.toUtf8().constData(),
+			asset_id, obs_dir);
 
 		if (ok) {
-			/* Write version file */
-			char ver_path[512];
-			snprintf(ver_path, sizeof(ver_path), "%s%c%s.version",
-				 obs_dir,
-#ifdef _WIN32
-				 '\\',
-#else
-				 '/',
-#endif
-				 slug.toUtf8().constData());
-			FILE *f = fopen(ver_path, "w");
-			if (f) {
-				fputs(version.toUtf8().constData(), f);
-				fclose(f);
-			}
+			downloader_write_version_file(
+				obs_dir, slug.toUtf8().constData(),
+				version.toUtf8().constData());
 
 			btn->setText(de ? "Aktuell" : "Up to date");
 			btn->setEnabled(false);
@@ -322,11 +327,19 @@ private:
 
 			onRefresh();
 		} else {
-			btn->setText(de ? "Fehlgeschlagen" : "Failed");
-			QTimer::singleShot(2000, [btn, de]() {
-				btn->setText(de ? "Erneut versuchen" : "Retry");
-				btn->setEnabled(true);
-			});
+			const char *err = downloader_last_error();
+			QString detail = err && err[0]
+				? QString::fromUtf8(err)
+				: (de ? "Unbekannter Fehler" : "Unknown error");
+
+			QMessageBox::critical(
+				this, "stools Plugin Manager",
+				QString(de ? "Installation von %1 fehlgeschlagen:\n%2"
+					   : "Installation of %1 failed:\n%2")
+					.arg(slug, detail));
+
+			btn->setText(de ? "Erneut versuchen" : "Retry");
+			btn->setEnabled(true);
 		}
 	}
 };

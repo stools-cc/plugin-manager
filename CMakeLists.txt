@@ -16,6 +16,7 @@ add_library(st-pluginmanager MODULE
     src/plugin-main.c
     src/auth.c
     src/downloader.c
+    src/oauth.c
     src/obfuscation.cpp
     src/manager-dialog.cpp
 )
@@ -71,6 +72,7 @@ if(WIN32)
         obs_frontend
         w32_pthreads
         shell32
+        ws2_32
         Qt6::Core
         Qt6::Gui
         Qt6::Widgets
