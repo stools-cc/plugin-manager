@@ -285,15 +285,16 @@ private:
 				&ManagerDialog::onInstallClicked);
 			m_table->setCellWidget(i, 3, btn);
 
-			auto *delBtn = new QPushButton(
-				de ? "Deinstallieren" : "Uninstall");
-			delBtn->setEnabled(pi->installed);
-			delBtn->setProperty("slug", QString(pi->slug));
-			delBtn->setStyleSheet(
-				"QPushButton { color: #cc3333; }");
-			connect(delBtn, &QPushButton::clicked, this,
-				&ManagerDialog::onUninstallClicked);
-			m_table->setCellWidget(i, 4, delBtn);
+			if (pi->installed) {
+				auto *delBtn = new QPushButton(
+					de ? "Deinstallieren" : "Uninstall");
+				delBtn->setProperty("slug", QString(pi->slug));
+				delBtn->setStyleSheet(
+					"QPushButton { color: #cc3333; }");
+				connect(delBtn, &QPushButton::clicked, this,
+					&ManagerDialog::onUninstallClicked);
+				m_table->setCellWidget(i, 4, delBtn);
+			}
 		}
 	}
 
