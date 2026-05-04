@@ -29,7 +29,9 @@ struct plugin_list {
 
 bool downloader_fetch_plugin_list(const char *token, struct plugin_list *out);
 bool downloader_install_plugin(const char *token, const char *slug,
-			       int asset_id, const char *obs_plugin_dir);
+			       int asset_id, const char *version,
+			       const char *obs_plugin_dir);
+bool downloader_uninstall_plugin(const char *slug, const char *obs_plugin_dir);
 void downloader_detect_installed(struct plugin_list *list,
 				 const char *obs_plugin_dir);
 bool downloader_get_obs_plugin_dir(char *buf, size_t sz);

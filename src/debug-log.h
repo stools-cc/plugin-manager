@@ -14,7 +14,13 @@
 
 #ifndef LOG_ERROR
 #define LOG_ERROR   100
+#endif
+#ifndef LOG_WARNING
 #define LOG_WARNING 200
+#endif
+#ifndef LOG_INFO
 #define LOG_INFO    300
+#endif
+#ifndef LOG_DEBUG
 #define LOG_DEBUG   400
 #endif

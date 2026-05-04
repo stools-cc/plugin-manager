@@ -15,6 +15,14 @@
 #include <QThread>
 #include <QTimer>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h>
+#else
+#include <unistd.h>
+#include <sys/stat.h>
+#endif
+
 #include <obs-frontend-api.h>
 
 extern "C" {
@@ -79,11 +87,11 @@ public:
 		mainLayout->addWidget(sep);
 
 		/* ---- Plugin table ---- */
-		m_table = new QTableWidget(0, 4);
+		m_table = new QTableWidget(0, 5);
 		m_table->setHorizontalHeaderLabels(
 			{de ? "Plugin" : "Plugin",
 			 de ? "Installiert" : "Installed",
-			 de ? "Verfügbar" : "Available", ""});
+			 de ? "Verfügbar" : "Available", "", ""});
 		m_table->horizontalHeader()->setStretchLastSection(false);
 		m_table->horizontalHeader()->setSectionResizeMode(
 			0, QHeaderView::Stretch);
@@ -93,9 +101,12 @@ public:
 			2, QHeaderView::Fixed);
 		m_table->horizontalHeader()->setSectionResizeMode(
 			3, QHeaderView::Fixed);
+		m_table->horizontalHeader()->setSectionResizeMode(
+			4, QHeaderView::Fixed);
 		m_table->setColumnWidth(1, 120);
 		m_table->setColumnWidth(2, 90);
 		m_table->setColumnWidth(3, 110);
+		m_table->setColumnWidth(4, 110);
 		m_table->verticalHeader()->setVisible(false);
 		m_table->setSelectionMode(QAbstractItemView::NoSelection);
 		m_table->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -273,6 +284,16 @@ private:
 			connect(btn, &QPushButton::clicked, this,
 				&ManagerDialog::onInstallClicked);
 			m_table->setCellWidget(i, 3, btn);
+
+			auto *delBtn = new QPushButton(
+				de ? "Deinstallieren" : "Uninstall");
+			delBtn->setEnabled(pi->installed);
+			delBtn->setProperty("slug", QString(pi->slug));
+			delBtn->setStyleSheet(
+				"QPushButton { color: #cc3333; }");
+			connect(delBtn, &QPushButton::clicked, this,
+				&ManagerDialog::onUninstallClicked);
+			m_table->setCellWidget(i, 4, delBtn);
 		}
 	}
 
@@ -309,23 +330,85 @@ private:
 
 		bool ok = downloader_install_plugin(
 			auth_get_token(), slug.toUtf8().constData(),
-			asset_id, obs_dir);
+			asset_id, version.toUtf8().constData(), obs_dir);
 
 		if (ok) {
-			downloader_write_version_file(
-				obs_dir, slug.toUtf8().constData(),
-				version.toUtf8().constData());
 
 			btn->setText(de ? "Aktuell" : "Up to date");
 			btn->setEnabled(false);
-
-			QMessageBox::information(
-				this, "stools Plugin Manager",
-				QString(de ? "%1 wurde installiert. Bitte OBS neu starten."
-					   : "%1 has been installed. Please restart OBS.")
-					.arg(slug));
-
 			onRefresh();
+
+			auto answer = QMessageBox::question(
+				this, "stools Plugin Manager",
+				de ? "Installation erfolgreich!\nOBS jetzt neu starten?"
+				   : "Installation successful!\nRestart OBS now?",
+				QMessageBox::Yes | QMessageBox::No,
+				QMessageBox::Yes);
+
+			if (answer == QMessageBox::Yes) {
+				char exe[512];
+#ifdef _WIN32
+				DWORD pid = GetCurrentProcessId();
+				GetModuleFileNameA(NULL, exe, sizeof(exe));
+				char obs_bin[512];
+				snprintf(obs_bin, sizeof(obs_bin), "%s", exe);
+				char *ls = strrchr(obs_bin, '\\');
+				if (ls) *ls = '\0';
+				char tmp[512];
+				GetTempPathA(sizeof(tmp), tmp);
+				char ps_path[512];
+				snprintf(ps_path, sizeof(ps_path), "%sst_pm_restart.ps1", tmp);
+				FILE *bf = fopen(ps_path, "w");
+				if (bf) {
+					fprintf(bf, "do { Start-Sleep -Seconds 1 } while (Get-Process -Id %lu -ErrorAction SilentlyContinue)\n",
+						(unsigned long)pid);
+					fprintf(bf, "Start-Sleep -Seconds 2\n");
+					fprintf(bf, "Start-Process -FilePath '%s' -WorkingDirectory '%s'\n", exe, obs_bin);
+					fprintf(bf, "Remove-Item -LiteralPath '%s' -Force\n", ps_path);
+					fclose(bf);
+					char ps_args[2048];
+					snprintf(ps_args, sizeof(ps_args),
+						 "-NoProfile -WindowStyle Hidden "
+						 "-ExecutionPolicy Bypass -File \"%s\"",
+						 ps_path);
+					ShellExecuteA(NULL, "open", "powershell.exe",
+						      ps_args, NULL, SW_HIDE);
+				}
+#else
+				{
+					pid_t pid = getpid();
+					char tmp_dir[256] = "/tmp";
+					char script[512];
+					snprintf(script, sizeof(script),
+						 "%s/st_pm_restart.sh", tmp_dir);
+					FILE *sf = fopen(script, "w");
+					if (sf) {
+						fprintf(sf, "#!/bin/sh\n");
+						fprintf(sf, "while kill -0 %d 2>/dev/null; do sleep 1; done\n", pid);
+						fprintf(sf, "sleep 2\n");
+#ifdef __APPLE__
+						fprintf(sf, "open -a OBS\n");
+#else
+						char self[512] = "";
+						ssize_t l = readlink("/proc/self/exe", self, sizeof(self)-1);
+						if (l > 0) { self[l] = '\0'; fprintf(sf, "nohup '%s' >/dev/null 2>&1 &\n", self); }
+#endif
+						fprintf(sf, "rm -f '%s'\n", script);
+						fclose(sf);
+						chmod(script, 0755);
+						if (fork() == 0) {
+							setsid();
+							execl("/bin/sh", "sh", script, (char *)NULL);
+							_exit(1);
+						}
+					}
+				}
+#endif
+				/* Gracefully close OBS via main window */
+				QMainWindow *main = (QMainWindow *)obs_frontend_get_main_window();
+				if (main)
+					main->close();
+			}
 		} else {
 			const char *err = downloader_last_error();
 			QString detail = err && err[0]
@@ -340,6 +423,54 @@ private:
 
 			btn->setText(de ? "Erneut versuchen" : "Retry");
 			btn->setEnabled(true);
+		}
+	}
+
+	void onUninstallClicked()
+	{
+		auto *btn = qobject_cast<QPushButton *>(sender());
+		if (!btn) return;
+
+		QString slug = btn->property("slug").toString();
+		bool de = is_de(m_locale.toUtf8().constData());
+
+		auto answer = QMessageBox::question(
+			this, "stools Plugin Manager",
+			QString(de ? "%1 deinstallieren?\nOBS wird dafür neu gestartet."
+				   : "Uninstall %1?\nOBS will restart for this.").arg(slug),
+			QMessageBox::Yes | QMessageBox::No,
+			QMessageBox::No);
+
+		if (answer != QMessageBox::Yes) return;
+
+		char obs_dir[512];
+		if (!downloader_get_obs_plugin_dir(obs_dir, sizeof(obs_dir))) {
+			QMessageBox::critical(
+				this, "stools Plugin Manager",
+				de ? "OBS Plugin-Verzeichnis nicht gefunden."
+				   : "OBS plugin directory not found.");
+			return;
+		}
+
+		bool ok = downloader_uninstall_plugin(
+			slug.toUtf8().constData(), obs_dir);
+
+		if (ok) {
+			/* Script is running in background, waiting for OBS to exit.
+			   Close OBS gracefully - script will delete files then restart. */
+			QMainWindow *main = (QMainWindow *)obs_frontend_get_main_window();
+			if (main)
+				main->close();
+		} else {
+			const char *err = downloader_last_error();
+			QString detail = err && err[0]
+				? QString::fromUtf8(err)
+				: (de ? "Unbekannter Fehler" : "Unknown error");
+			QMessageBox::critical(
+				this, "stools Plugin Manager",
+				QString(de ? "Deinstallation von %1 fehlgeschlagen:\n%2"
+					   : "Uninstall of %1 failed:\n%2")
+					.arg(slug, detail));
 		}
 	}
 };

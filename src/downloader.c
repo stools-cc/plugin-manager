@@ -1,7 +1,9 @@
 #include "downloader.h"
 #include "obfuscation.h"
-#include "debug-log.h"
 #include "compat.h"
+
+#include <obs-module.h>
+#include "debug-log.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +20,9 @@
 #else
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #define PATH_SEP '/'
 #endif
 
@@ -347,8 +352,19 @@ bool downloader_fetch_plugin_list(const char *token, struct plugin_list *out)
 
 					if (strcmp(asset_plat, plat) == 0 &&
 					    asset_id > 0) {
-						pi->download_asset_id = asset_id;
-						break;
+						/* Only accept archive formats, skip installers */
+						size_t fnlen = strlen(asset_fn);
+#ifdef _WIN32
+						bool is_archive = (fnlen > 4 &&
+							strcmp(asset_fn + fnlen - 4, ".zip") == 0);
+#else
+						bool is_archive = (fnlen > 7 &&
+							strcmp(asset_fn + fnlen - 7, ".tar.gz") == 0);
+#endif
+						if (is_archive) {
+							pi->download_asset_id = asset_id;
+							break;
+						}
 					}
 					asset_pos++;
 				}
@@ -575,17 +591,16 @@ static void remove_directory(const char *dir)
 }
 
 /*
- * Copy a file with UAC elevation on Windows.
- * Launches a hidden PowerShell process as Administrator.
+ * Run a PowerShell command with UAC elevation on Windows.
+ * Single UAC prompt for all operations.
  */
 #ifdef _WIN32
-static bool copy_elevated(const char *src, const char *dst)
+static bool run_elevated(const char *ps_command)
 {
-	char ps_args[2048];
+	char ps_args[4096];
 	snprintf(ps_args, sizeof(ps_args),
-		 "-NoProfile -WindowStyle Hidden -Command \""
-		 "Copy-Item -Force -Path '%s' -Destination '%s'\"",
-		 src, dst);
+		 "-NoProfile -WindowStyle Hidden -Command \"%s\"",
+		 ps_command);
 
 	SHELLEXECUTEINFOA sei;
 	memset(&sei, 0, sizeof(sei));
@@ -608,6 +623,81 @@ static bool copy_elevated(const char *src, const char *dst)
 	DWORD exit_code = 1;
 	GetExitCodeProcess(proc, &exit_code);
 	CloseHandle(proc);
+
+	return exit_code == 0;
+}
+
+/*
+ * Copy plugin DLL + write version file in a single elevated process.
+ * Only one UAC prompt for the entire install.
+ */
+static bool install_elevated(const char *src_dll, const char *dst_dll,
+			     const char *plugin_dir, const char *slug,
+			     const char *version)
+{
+	char ver_path[512];
+	snprintf(ver_path, sizeof(ver_path), "%s\\.%s.version",
+		 plugin_dir, slug);
+
+	/* Write a temp .ps1 script to avoid quoting issues */
+	char tmp_d[512];
+	get_temp_dir(tmp_d, sizeof(tmp_d));
+	char script_path[512];
+	snprintf(script_path, sizeof(script_path),
+		 "%s\\st_pm_install.ps1", tmp_d);
+
+	FILE *sf = fopen(script_path, "w");
+	if (!sf) return false;
+
+	fprintf(sf, "$ErrorActionPreference = 'Stop'\n");
+	fprintf(sf, "Copy-Item -Force -LiteralPath '%s' -Destination '%s'\n",
+		src_dll, dst_dll);
+	if (version && version[0]) {
+		fprintf(sf, "[System.IO.File]::WriteAllText('%s', '%s')\n",
+			ver_path, version);
+		fprintf(sf, "(Get-Item -LiteralPath '%s' -Force).Attributes = 'Hidden'\n",
+			ver_path);
+	}
+	fclose(sf);
+
+	dbg_log(LOG_INFO, "[%s] Elevated install: %s -> %s",
+		PLUGIN_NAME, src_dll, dst_dll);
+
+	char ps_cmd[2048];
+	snprintf(ps_cmd, sizeof(ps_cmd),
+		 "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass "
+		 "-File \"%s\"", script_path);
+
+	SHELLEXECUTEINFOA sei;
+	memset(&sei, 0, sizeof(sei));
+	sei.cbSize = sizeof(sei);
+	sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+	sei.lpVerb = "runas";
+	sei.lpFile = "powershell.exe";
+	sei.lpParameters = ps_cmd;
+	sei.nShow = SW_HIDE;
+
+	if (!ShellExecuteExA(&sei)) {
+		dbg_log(LOG_ERROR, "[%s] UAC elevation denied",
+			PLUGIN_NAME);
+		remove(script_path);
+		return false;
+	}
+
+	HANDLE proc = sei.hProcess;
+	WaitForSingleObject(proc, 30000);
+
+	DWORD exit_code = 1;
+	GetExitCodeProcess(proc, &exit_code);
+	CloseHandle(proc);
+
+	remove(script_path);
+
+	if (exit_code != 0) {
+		dbg_log(LOG_ERROR,
+			"[%s] Elevated install failed (exit %lu)",
+			PLUGIN_NAME, exit_code);
+	}
 
 	return exit_code == 0;
 }
@@ -650,7 +740,12 @@ bool downloader_write_version_file(const char *obs_plugin_dir,
 	fputs(version, f);
 	fclose(f);
 
-	bool ok = copy_elevated(tmp_ver, ver_path);
+	char ps_cmd[2048];
+	snprintf(ps_cmd, sizeof(ps_cmd),
+		 "Copy-Item -Force -Path '%s' -Destination '%s'; "
+		 "Set-ItemProperty -Path '%s' -Name Attributes -Value ([System.IO.FileAttributes]::Hidden)",
+		 tmp_ver, ver_path, ver_path);
+	bool ok = run_elevated(ps_cmd);
 	remove(tmp_ver);
 	return ok;
 #else
@@ -661,7 +756,8 @@ bool downloader_write_version_file(const char *obs_plugin_dir,
 /* ---- Download and install a plugin ---- */
 
 bool downloader_install_plugin(const char *token, const char *slug,
-			       int asset_id, const char *obs_plugin_dir)
+			       int asset_id, const char *version,
+			       const char *obs_plugin_dir)
 {
 	s_last_error[0] = '\0';
 
@@ -691,7 +787,7 @@ bool downloader_install_plugin(const char *token, const char *slug,
 
 	char archive_path[512];
 	snprintf(archive_path, sizeof(archive_path),
-		 "%s%cst_pm_%s_download", tmp_dir, PATH_SEP, slug);
+		 "%s%cst_pm_%s_download.zip", tmp_dir, PATH_SEP, slug);
 
 	FILE *f = fopen(archive_path, "wb");
 	if (!f) {
@@ -741,120 +837,306 @@ bool downloader_install_plugin(const char *token, const char *slug,
 		return false;
 	}
 
-	/* Check if it's an archive or a raw binary */
+	/*
+	 * ZIP structure mirrors OBS install dir:
+	 *   obs-plugins/64bit/easy-irl-stream.dll
+	 *
+	 * So we just extract directly into the OBS root directory.
+	 * OBS root = obs_plugin_dir minus "obs-plugins/64bit"
+	 */
+	char obs_root[512];
+	snprintf(obs_root, sizeof(obs_root), "%s", obs_plugin_dir);
+
+	/* Strip trailing obs-plugins/64bit (or obs-plugins) to get OBS root */
+#ifdef _WIN32
+	char *cut = strstr(obs_root, "\\obs-plugins\\64bit");
+	if (!cut) cut = strstr(obs_root, "\\obs-plugins");
+#else
+	char *cut = strstr(obs_root, "/obs-plugins");
+#endif
+	if (cut) *cut = '\0';
+
+	blog(LOG_INFO, "[%s] OBS root: %s", PLUGIN_NAME, obs_root);
+	blog(LOG_INFO, "[%s] Archive: %s", PLUGIN_NAME, archive_path);
+	blog(LOG_INFO, "[%s] Plugin dir: %s", PLUGIN_NAME, obs_plugin_dir);
+
 	bool success = false;
-	char final_path[512];
-	snprintf(final_path, sizeof(final_path), "%s%c%s%s",
-		 obs_plugin_dir, PATH_SEP, slug, ext);
-
-	if (is_zip(archive_path) || is_targz(archive_path)) {
-		/* Extract to temp, then find the binary */
-		char extract_dir[512];
-		snprintf(extract_dir, sizeof(extract_dir),
-			 "%s%cst_pm_%s_extract", tmp_dir, PATH_SEP, slug);
-
-		remove_directory(extract_dir);
-
-		dbg_log(LOG_INFO, "[%s] Extracting archive for %s",
-			PLUGIN_NAME, slug);
-
-		if (!extract_archive(archive_path, extract_dir)) {
-			set_error("Failed to extract archive for %s", slug);
-			dbg_log(LOG_ERROR, "[%s] Failed to extract archive for %s",
-				PLUGIN_NAME, slug);
-			remove(archive_path);
-			remove_directory(extract_dir);
-			return false;
-		}
-
-		/* Find the DLL/SO inside the extracted tree */
-		char dll_filename[128];
-		snprintf(dll_filename, sizeof(dll_filename), "%s%s", slug, ext);
-
-		char found_path[512] = "";
-		if (!find_plugin_binary(extract_dir, dll_filename,
-					found_path, sizeof(found_path))) {
-			set_error("Could not find %s in archive", dll_filename);
-			dbg_log(LOG_ERROR,
-				"[%s] Could not find %s in extracted archive",
-				PLUGIN_NAME, dll_filename);
-			remove(archive_path);
-			remove_directory(extract_dir);
-			return false;
-		}
-
-		dbg_log(LOG_INFO, "[%s] Found binary at: %s",
-			PLUGIN_NAME, found_path);
-
-		/* Ensure target dir exists */
-		ensure_dir_exists(obs_plugin_dir);
-
-		/* Copy to OBS plugin dir (try normal, then elevated) */
-		remove(final_path);
 
 #ifdef _WIN32
-		success = CopyFileA(found_path, final_path, FALSE);
-		if (!success) {
-			DWORD copy_err = GetLastError();
-			dbg_log(LOG_INFO,
-				"[%s] Normal copy failed (err %lu), trying elevated",
-				PLUGIN_NAME, copy_err);
-			success = copy_elevated(found_path, final_path);
-		}
-#else
-		{
-			char cp_cmd[1024];
-			snprintf(cp_cmd, sizeof(cp_cmd),
-				 "cp '%s' '%s'", found_path, final_path);
-			success = system(cp_cmd) == 0;
-			if (!success) {
-				snprintf(cp_cmd, sizeof(cp_cmd),
-					 "pkexec cp '%s' '%s'",
-					 found_path, final_path);
-				success = system(cp_cmd) == 0;
+	{
+		char script_path[512];
+		snprintf(script_path, sizeof(script_path),
+			 "%s\\st_pm_install.ps1", tmp_dir);
+
+		FILE *sf = fopen(script_path, "w");
+		if (sf) {
+			char ver_path[512];
+			snprintf(ver_path, sizeof(ver_path),
+				 "%s\\.%s.version", obs_plugin_dir, slug);
+
+			fprintf(sf, "$ErrorActionPreference = 'Stop'\n");
+			fprintf(sf, "$log = '%s\\st_pm_error.log'\n", tmp_dir);
+			fprintf(sf, "try {\n");
+			fprintf(sf, "  $archivePath = '%s'\n", archive_path);
+			fprintf(sf, "  $destPath = '%s'\n", obs_root);
+			fprintf(sf, "  \"Archive: $archivePath\" | Out-File -Encoding utf8 $log\n");
+			fprintf(sf, "  \"Dest: $destPath\" | Out-File -Encoding utf8 -Append $log\n");
+			fprintf(sf, "  \"Exists: $(Test-Path $archivePath)\" | Out-File -Encoding utf8 -Append $log\n");
+			fprintf(sf, "  if (Test-Path $archivePath) {\n");
+			fprintf(sf, "    \"Size: $((Get-Item $archivePath).Length) bytes\" | Out-File -Encoding utf8 -Append $log\n");
+			fprintf(sf, "  }\n");
+			fprintf(sf, "  Expand-Archive -Force -Path $archivePath -DestinationPath $destPath\n");
+			if (version && version[0]) {
+				fprintf(sf, "  if (Test-Path -LiteralPath '%s') { (Get-Item -LiteralPath '%s' -Force).Attributes = 'Normal' }\n",
+					ver_path, ver_path);
+				fprintf(sf, "  '%s' | Set-Content -LiteralPath '%s' -Force\n",
+					version, ver_path);
+				fprintf(sf, "  (Get-Item -LiteralPath '%s' -Force).Attributes = 'Hidden'\n",
+					ver_path);
 			}
-		}
-#endif
+			fprintf(sf, "  \"SUCCESS\" | Out-File -Encoding utf8 -Append $log\n");
+			fprintf(sf, "} catch {\n");
+			fprintf(sf, "  \"ERROR: $($_.Exception.Message)\" | Out-File -Encoding utf8 -Append $log\n");
+			fprintf(sf, "  \"Stack: $($_.ScriptStackTrace)\" | Out-File -Encoding utf8 -Append $log\n");
+			fprintf(sf, "  exit 1\n");
+			fprintf(sf, "}\n");
+			fclose(sf);
 
-		remove_directory(extract_dir);
-	} else {
-		/* Raw binary - just move to final location */
-		remove(final_path);
-#ifdef _WIN32
-		success = CopyFileA(archive_path, final_path, FALSE);
-		if (!success) {
-			dbg_log(LOG_INFO,
-				"[%s] Normal copy failed, trying elevated",
-				PLUGIN_NAME);
-			success = copy_elevated(archive_path, final_path);
+			blog(LOG_INFO, "[%s] Install script: %s",
+			     PLUGIN_NAME, script_path);
+
+			char ps_args[2048];
+			snprintf(ps_args, sizeof(ps_args),
+				 "-NoProfile -WindowStyle Hidden "
+				 "-ExecutionPolicy Bypass -File \"%s\"",
+				 script_path);
+
+			SHELLEXECUTEINFOA sei;
+			memset(&sei, 0, sizeof(sei));
+			sei.cbSize = sizeof(sei);
+			sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+			sei.lpVerb = "runas";
+			sei.lpFile = "powershell.exe";
+			sei.lpParameters = ps_args;
+			sei.nShow = SW_HIDE;
+
+			if (ShellExecuteExA(&sei)) {
+				HANDLE proc = sei.hProcess;
+				WaitForSingleObject(proc, 60000);
+				DWORD exit_code = 1;
+				GetExitCodeProcess(proc, &exit_code);
+				CloseHandle(proc);
+				success = (exit_code == 0);
+
+				char err_log_path[512];
+				snprintf(err_log_path, sizeof(err_log_path),
+					 "%s\\st_pm_error.log", tmp_dir);
+				FILE *ef = fopen(err_log_path, "r");
+				if (ef) {
+					char err_buf[2048] = "";
+					size_t n = fread(err_buf, 1, sizeof(err_buf)-1, ef);
+					err_buf[n] = '\0';
+					fclose(ef);
+					/* Log line by line */
+					char *line = strtok(err_buf, "\r\n");
+					while (line) {
+						if (line[0])
+							blog(LOG_INFO,
+							     "[%s] PS> %s",
+							     PLUGIN_NAME, line);
+						line = strtok(NULL, "\r\n");
+					}
+					if (!success) {
+						blog(LOG_ERROR,
+						     "[%s] Install FAILED (exit %lu)",
+						     PLUGIN_NAME, exit_code);
+						set_error("PowerShell exit %lu - see OBS log", exit_code);
+					}
+					remove(err_log_path);
+				} else if (!success) {
+					blog(LOG_ERROR,
+					     "[%s] Install script exit code: %lu (no log)",
+					     PLUGIN_NAME, exit_code);
+				}
+			} else {
+				DWORD se_err = GetLastError();
+				blog(LOG_ERROR,
+				     "[%s] ShellExecuteEx failed (error %lu)",
+				     PLUGIN_NAME, se_err);
+			}
+
+			remove(script_path);
+		} else {
+			blog(LOG_ERROR, "[%s] Cannot create install script",
+			     PLUGIN_NAME);
 		}
-#else
-		success = rename(archive_path, final_path) == 0;
-		if (!success) {
-			char cp_cmd[1024];
-			snprintf(cp_cmd, sizeof(cp_cmd),
-				 "pkexec cp '%s' '%s'",
-				 archive_path, final_path);
-			success = system(cp_cmd) == 0;
-		}
-#endif
 	}
+#else
+	if (is_targz(archive_path)) {
+		char cmd[2048];
+		snprintf(cmd, sizeof(cmd),
+			 "tar xzf '%s' -C '%s'", archive_path, obs_root);
+		success = system(cmd) == 0;
+		if (!success) {
+			snprintf(cmd, sizeof(cmd),
+				 "pkexec tar xzf '%s' -C '%s'",
+				 archive_path, obs_root);
+			success = system(cmd) == 0;
+		}
+	} else {
+		char cmd[2048];
+		snprintf(cmd, sizeof(cmd),
+			 "unzip -o '%s' -d '%s'", archive_path, obs_root);
+		success = system(cmd) == 0;
+		if (!success) {
+			snprintf(cmd, sizeof(cmd),
+				 "pkexec unzip -o '%s' -d '%s'",
+				 archive_path, obs_root);
+			success = system(cmd) == 0;
+		}
+	}
+	if (success && version && version[0])
+		downloader_write_version_file(obs_plugin_dir, slug, version);
+#endif
 
 	remove(archive_path);
 
 	if (success) {
 		dbg_log(LOG_INFO, "[%s] Installed %s to %s",
-			PLUGIN_NAME, slug, final_path);
+			PLUGIN_NAME, slug, obs_root);
 	} else {
-#ifdef _WIN32
-		DWORD err = GetLastError();
-		set_error("Failed to copy to %s (error %lu)", final_path, err);
-#else
-		set_error("Failed to copy to %s", final_path);
-#endif
+		set_error("Failed to extract to %s", obs_root);
 		dbg_log(LOG_ERROR, "[%s] Failed to install %s to %s",
-			PLUGIN_NAME, slug, final_path);
+			PLUGIN_NAME, slug, obs_root);
 	}
 
 	return success;
+}
+
+bool downloader_uninstall_plugin(const char *slug, const char *obs_plugin_dir)
+{
+	if (!slug || !obs_plugin_dir) return false;
+
+	char dll_path[512];
+	char ver_path[512];
+
+#ifdef _WIN32
+	snprintf(dll_path, sizeof(dll_path), "%s\\%s.dll", obs_plugin_dir, slug);
+	snprintf(ver_path, sizeof(ver_path), "%s\\.%s.version", obs_plugin_dir, slug);
+#else
+	snprintf(dll_path, sizeof(dll_path), "%s/%s.so", obs_plugin_dir, slug);
+	snprintf(ver_path, sizeof(ver_path), "%s/.%s.version", obs_plugin_dir, slug);
+#endif
+
+	blog(LOG_INFO, "[%s] Uninstalling %s from %s", PLUGIN_NAME, slug, dll_path);
+
+	char tmp_dir[512];
+	get_temp_dir(tmp_dir, sizeof(tmp_dir));
+
+#ifdef _WIN32
+	{
+		DWORD pid = GetCurrentProcessId();
+		char exe[512];
+		GetModuleFileNameA(NULL, exe, sizeof(exe));
+
+		char script_path[512];
+		snprintf(script_path, sizeof(script_path),
+			 "%s\\st_pm_uninstall.ps1", tmp_dir);
+
+		FILE *sf = fopen(script_path, "w");
+		if (!sf) {
+			set_error("Cannot create uninstall script");
+			return false;
+		}
+
+		/* Derive OBS bin directory from exe path */
+		char obs_bin[512];
+		snprintf(obs_bin, sizeof(obs_bin), "%s", exe);
+		char *last_slash = strrchr(obs_bin, '\\');
+		if (last_slash) *last_slash = '\0';
+
+		fprintf(sf, "do { Start-Sleep -Seconds 1 } while (Get-Process -Id %lu -ErrorAction SilentlyContinue)\n",
+			(unsigned long)pid);
+		fprintf(sf, "Start-Sleep -Seconds 2\n");
+		fprintf(sf, "Remove-Item -LiteralPath '%s' -Force -ErrorAction SilentlyContinue\n", dll_path);
+		fprintf(sf, "if (Test-Path -LiteralPath '%s') { (Get-Item -LiteralPath '%s' -Force).Attributes = 'Normal'; Remove-Item -LiteralPath '%s' -Force }\n",
+			ver_path, ver_path, ver_path);
+		fprintf(sf, "Start-Sleep -Seconds 2\n");
+		fprintf(sf, "Start-Process -FilePath '%s' -WorkingDirectory '%s'\n", exe, obs_bin);
+		fprintf(sf, "Remove-Item -LiteralPath '%s' -Force\n", script_path);
+		fclose(sf);
+
+		char ps_args[2048];
+		snprintf(ps_args, sizeof(ps_args),
+			 "-NoProfile -WindowStyle Hidden "
+			 "-ExecutionPolicy Bypass -File \"%s\"",
+			 script_path);
+
+		SHELLEXECUTEINFOA sei;
+		memset(&sei, 0, sizeof(sei));
+		sei.cbSize = sizeof(sei);
+		sei.lpVerb = "runas";
+		sei.lpFile = "powershell.exe";
+		sei.lpParameters = ps_args;
+		sei.nShow = SW_HIDE;
+
+		if (!ShellExecuteExA(&sei)) {
+			remove(script_path);
+			set_error("UAC denied");
+			return false;
+		}
+	}
+#else
+	{
+		pid_t pid = getpid();
+
+		/* Get OBS executable path (platform-specific) */
+		char exe[512] = "";
+#ifdef __APPLE__
+		uint32_t exe_size = sizeof(exe);
+		_NSGetExecutablePath(exe, &exe_size);
+#else
+		ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+		if (len > 0) exe[len] = '\0';
+#endif
+
+		char script_path[512];
+		snprintf(script_path, sizeof(script_path),
+			 "%s/st_pm_uninstall.sh", tmp_dir);
+
+		FILE *sf = fopen(script_path, "w");
+		if (!sf) {
+			set_error("Cannot create uninstall script");
+			return false;
+		}
+
+		/* Detect if we need elevated privileges */
+		bool needs_elevation = (access(obs_plugin_dir, W_OK) != 0);
+
+		fprintf(sf, "#!/bin/sh\n");
+		fprintf(sf, "while kill -0 %d 2>/dev/null; do sleep 1; done\n", pid);
+		fprintf(sf, "sleep 2\n");
+		if (needs_elevation) {
+			fprintf(sf, "pkexec rm -f '%s' '%s'\n", dll_path, ver_path);
+		} else {
+			fprintf(sf, "rm -f '%s' '%s'\n", dll_path, ver_path);
+		}
+		fprintf(sf, "sleep 2\n");
+		if (exe[0]) {
+			fprintf(sf, "nohup '%s' >/dev/null 2>&1 &\n", exe);
+		}
+		fprintf(sf, "rm -f '%s'\n", script_path);
+		fclose(sf);
+		chmod(script_path, 0755);
+
+		if (fork() == 0) {
+			setsid();
+			execl("/bin/sh", "sh", script_path, NULL);
+			_exit(1);
+		}
+	}
+#endif
+
+	blog(LOG_INFO, "[%s] Uninstall script created for %s", PLUGIN_NAME, slug);
+	return true;
 }
