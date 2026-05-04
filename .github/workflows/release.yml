@@ -120,7 +120,7 @@ jobs:
             -DPLUGIN_VERSION_OVERRIDE="${{ steps.version.outputs.version }}"
           cmake --build build --config RelWithDebInfo
 
-      - name: Package
+      - name: Package ZIP
         shell: powershell
         run: |
           $ver = "${{ steps.version.outputs.version }}"
@@ -130,11 +130,21 @@ jobs:
           Copy-Item "build/st-pluginmanager.dll" "$dir/obs-plugins/64bit/"
           Compress-Archive -Path "$dir/*" -DestinationPath "release/st-pluginmanager-$ver-windows-x64.zip"
 
+      - name: Build installer
+        shell: powershell
+        run: |
+          choco install innosetup -y --no-progress | Out-Null
+          $ver = "${{ steps.version.outputs.version }}"
+          & "C:\Program Files (x86)\Inno Setup 6\iscc.exe" `
+            /DMyAppVersion=$ver installer/installer.iss
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
         with:
           name: windows-release
-          path: release/*
+          path: |
+            release/*
+            installer/release/*
 
   build-linux:
     runs-on: ubuntu-24.04
@@ -240,7 +250,12 @@ jobs:
           body: |
             ## Installation
 
-            ### Windows
+            ### Windows (Installer — recommended)
+            1. Download **`st-pluginmanager-${{ steps.version.outputs.version }}-windows-installer.exe`**
+            2. Run the installer — it auto-detects your OBS installation
+            3. Restart OBS
+
+            ### Windows (Manual)
             1. Download **`st-pluginmanager-${{ steps.version.outputs.version }}-windows-x64.zip`**
             2. Extract into your OBS Studio folder (e.g. `C:\Program Files\obs-studio\`)
             3. Restart OBS
